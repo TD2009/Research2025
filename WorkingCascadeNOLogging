@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""
+IDK Cascade Gesture Detection:
+- Audio wake word (Porcupine) triggers vision cascade
+- Light: MediaPipe BlazeFace (face detection → bbox)
+- Medium: Dlib (68 landmarks → gestures manually computed)
+- Heavy: MediaPipe FaceMesh (468 landmarks → gestures manually computed)
+- Periodic face presence check every 30s
+- Logs per-frame metrics and gestures
+"""
+
+import os
+import time
+import threading
+import queue
+import struct
+import csv
+import numpy as np
+from collections import deque, defaultdict
+from datetime import datetime
+import cv2
+import mediapipe as mp
+import dlib
+import pvporcupine
+import pyaudio
+import psutil
+
+# ---------------------
+# === CONFIGURATION ===
+# ---------------------
+ACCESS_KEY = "9cunUiGZPhy31M1VUW5TBgQSc9Re48V5fXew+2V0KmjCDG/CkJo7Yw=="
+KEYWORD_PATH = "/Users/tanishdasari/Downloads/Start_en_mac_v3_0_0/Start_en_mac_v3_0_0.ppn"
+PREDICTOR_PATH = "/Users/tanishdasari/shape_predictor_68_face_landmarks.dat"
+CAM_INDEX = 0
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+CAPTURE_BUFFER = 120
+COOLDOWN_SECONDS = 1000
+CONF_TARGET = 0.85
+FACE_CHECK_INTERVAL_S = 30
+AUDIO_LOG_CSV = "porcupine_resource_log.csv"
+VISION_LOG_CSV = "vision_cascade_log.csv"
+
+# ---------------------
+# === Utilities ===
+# ---------------------
+class EWMA:
+    def __init__(self, alpha=0.3):
+        self.alpha = alpha
+        self.mean = None
+    def update(self, value):
+        if self.mean is None:
+            self.mean = value
+        else:
+            self.mean = self.alpha * value + (1 - self.alpha) * self.mean
+    def get(self):
+        return self.mean if self.mean is not None else 0.0
+
+# ======================
+# Frame Grabber Thread
+# ======================
+class FrameGrabber(threading.Thread):
+    def __init__(self, src=0, width=640, height=480, buffer_size=120):
+        super().__init__(daemon=True)
+        self.src = src
+        self.width = width
+        self.height = height
+        self.buffer = deque(maxlen=buffer_size)
+        self._stop = threading.Event()
+        self.cap = None
+
+    def run(self):
+        self.cap = cv2.VideoCapture(self.src)
+        if self.width:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        if self.height:
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        if not self.cap.isOpened():
+            print(f"[FrameGrabber] ERROR: cannot open camera src={self.src}")
+            return
+        while not self._stop.is_set():
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+            self.buffer.append(frame.copy())
+            time.sleep(0.001)
+
+    def stop(self):
+        self._stop.set()
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+    def latest(self):
+        return self.buffer[-1].copy() if self.buffer else None
+
+# ======================
+# Audio Wake Word Thread
+# ======================
+class AudioWakeWord(threading.Thread):
+    def __init__(self, access_key, keyword_path, wake_queue, log_csv=AUDIO_LOG_CSV, device_index=None):
+        super().__init__(daemon=True)
+        self.access_key = access_key
+        self.keyword_path = keyword_path
+        self.wake_queue = wake_queue
+        self.log_csv = log_csv
+        self.running = True
+        self.device_index = device_index
+        self.porcupine = None
+        self.pa = None
+        self.stream = None
+
+    def _safe_close(self):
+        try:
+            if self.stream is not None:
+                self.stream.stop_stream()
+                self.stream.close()
+        except Exception:
+            pass
+        try:
+            if self.pa is not None:
+                self.pa.terminate()
+        except Exception:
+            pass
+        try:
+            if self.porcupine is not None:
+                self.porcupine.delete()
+        except Exception:
+            pass
+
+    def run(self):
+        try:
+            self.porcupine = pvporcupine.create(access_key=self.access_key, keyword_paths=[self.keyword_path])
+        except Exception as e:
+            print("[AudioWakeWord] ERROR creating porcupine:", e)
+            return
+
+        self.pa = pyaudio.PyAudio()
+        try:
+            self.stream = self.pa.open(
+                rate=self.porcupine.sample_rate,
+                channels=1,
+                format=pyaudio.paInt16,
+                input=True,
+                frames_per_buffer=self.porcupine.frame_length,
+                input_device_index=self.device_index
+            )
+        except Exception as e:
+            print("[AudioWakeWord] ERROR opening audio stream:", e)
+            self._safe_close()
+            return
+
+        process = psutil.Process()
+        start_time = time.time()
+        last_log_time = 0
+
+        with open(self.log_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "Elapsed(s)", "CPU%", "Memory%", "RAM(MB)", "WakeDetected"])
+            print("[AudioWakeWord] Listening for wake word... (Ctrl+C to quit)")
+
+            while self.running:
+                pcm = self.stream.read(self.porcupine.frame_length, exception_on_overflow=False)
+                pcm_unpacked = struct.unpack_from("h"*self.porcupine.frame_length, pcm)
+                keyword_index = self.porcupine.process(pcm_unpacked)
+                wake_detected = (keyword_index >= 0)
+                if wake_detected:
+                    self.wake_queue.put(("START", time.time()))
+                now = time.time()
+                if now - last_log_time >= 0.5:
+                    cpu = process.cpu_percent(interval=None)
+                    mem_pct = process.memory_percent()
+                    ram_mb = process.memory_info().rss / (1024**2)
+                    elapsed = now - start_time
+                    writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), round(elapsed,2), cpu, mem_pct, round(ram_mb,2), "YES" if wake_detected else "NO"])
+                    f.flush()
+                    last_log_time = now
+
+# ======================
+# === Model Wrappers ===
+# ======================
+mp_face_detection = mp.solutions.face_detection
+mp_face_mesh = mp.solutions.face_mesh
+
+# --- BlazeFace Wrapper ---
+class BlazeFaceWrapper:
+    def __init__(self, min_detection_confidence=0.5):
+        self.min_conf = min_detection_confidence
+        self.model = None
+        self.eta = EWMA()
+    def _ensure(self):
+        if self.model is None:
+            self.model = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=self.min_conf)
+    def run(self, frame):
+        self._ensure()
+        t0 = time.time()
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.model.process(rgb)
+        runtime = (time.time()-t0)*1000
+        self.eta.update(runtime)
+        if results.detections:
+            d0 = results.detections[0]
+            score = float(d0.score[0]) if d0.score else 0.6
+            bbox = d0.location_data.relative_bounding_box
+            return {"label":"blazeface","bbox":bbox}, float(score), runtime
+        return None, 0.0, runtime
+
+# --- Dlib Wrapper (Medium) ---
+class DlibWrapper:
+    def __init__(self, predictor_path=PREDICTOR_PATH):
+        self.detector = dlib.get_frontal_face_detector()
+        self.predictor = dlib.shape_predictor(predictor_path)
+        self.eta = EWMA()
+        self.conf_ewma = EWMA(alpha=0.2)  # smooth confidence
+
+    def run(self, frame):
+        t0 = time.time()
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        rects = self.detector(gray, 1)
+        runtime = (time.time() - t0) * 1000.0
+        self.eta.update(runtime)
+
+        if len(rects) > 0:
+            shape = self.predictor(gray, rects[0])
+            pts = np.array([[p.x, p.y] for p in shape.parts()], dtype=np.int32)
+            gestures = compute_gestures_dlib(pts)
+
+            # Compute distances
+            face_height = max(np.linalg.norm(pts[8] - pts[27]), 1e-5)  # chin to nose top
+            eye_dist = np.linalg.norm(np.mean(pts[36:42], axis=0) - np.mean(pts[42:48], axis=0))
+            mouth_dist = np.linalg.norm(np.mean(pts[62:64], axis=0) - np.mean(pts[66:68], axis=0))
+
+            # Normalize and heuristic
+            eye_ratio = eye_dist / face_height
+            mouth_ratio = mouth_dist / face_height
+            conf_raw = 1.0 - 0.5*abs(eye_ratio - 0.3) - 0.5*abs(mouth_ratio - 0.08)
+            conf_raw = np.clip(conf_raw, 0.5, 1.0)  # minimum 0.5
+
+            conf = self.conf_ewma.update(conf_raw) or conf_raw
+
+            return {"label": "dlib_landmarks", "landmarks": pts, "gestures": gestures}, conf, runtime
+
+        return None, 0.0, runtime
+
+# --- FaceMesh Wrapper (Heavy) ---
+class FaceMeshWrapper:
+    def __init__(self, min_detection_confidence=0.5, min_tracking_confidence=0.5):
+        self.model = mp_face_mesh.FaceMesh(static_image_mode=False,
+                                           max_num_faces=1,
+                                           refine_landmarks=True,
+                                           min_detection_confidence=min_detection_confidence,
+                                           min_tracking_confidence=min_tracking_confidence)
+        self.eta = EWMA()
+    def run(self, frame):
+        t0 = time.time()
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.model.process(rgb)
+        runtime = (time.time()-t0)*1000
+        self.eta.update(runtime)
+        if results.multi_face_landmarks:
+            lm = results.multi_face_landmarks[0]
+            pts = np.array([[p.x, p.y, getattr(p,"z",0.0)] for p in lm.landmark])
+            gestures = compute_gestures_facemesh(pts)
+            return {"label":"landmarks_facemesh","landmarks":pts,"gestures":gestures}, 0.95, runtime
+        return None, 0.0, runtime
+
+# ======================
+# Gesture Computation Functions
+# ======================
+def compute_gestures_dlib(landmarks):
+    gestures = {}
+    top_lip = np.mean(landmarks[62:64], axis=0)
+    bottom_lip = np.mean(landmarks[66:68], axis=0)
+    gestures["mouth_open"] = float(np.linalg.norm(top_lip-bottom_lip)>5)
+    left_corner = landmarks[48]
+    right_corner = landmarks[54]
+    gestures["smile"] = float(left_corner[1]<landmarks[51][1] and right_corner[1]<landmarks[51][1])
+    gestures["left_eye_open"] = float(np.linalg.norm(np.mean(landmarks[43:45],axis=0)-np.mean(landmarks[47:49],axis=0))>2)
+    gestures["right_eye_open"] = float(np.linalg.norm(np.mean(landmarks[37:39],axis=0)-np.mean(landmarks[41:43],axis=0))>2)
+    gestures["left_eye_closed"]=1.0-gestures["left_eye_open"]
+    gestures["right_eye_closed"]=1.0-gestures["right_eye_open"]
+    gestures["left_eyebrow_up"]=float(np.mean(landmarks[19:22],axis=0)[1]<landmarks[27][1])
+    gestures["left_eyebrow_down"]=1.0-gestures["left_eyebrow_up"]
+    gestures["right_eyebrow_up"]=float(np.mean(landmarks[22:25],axis=0)[1]<landmarks[27][1])
+    gestures["right_eyebrow_down"]=1.0-gestures["right_eyebrow_up"]
+    return gestures
+
+def compute_gestures_facemesh(landmarks):
+    gestures = {}
+    top_lip = np.mean(landmarks[[13,14]], axis=0)
+    bottom_lip = np.mean(landmarks[[17,18]], axis=0)
+    gestures["mouth_open"] = float(np.linalg.norm(top_lip-bottom_lip)>0.03)
+    left_corner = landmarks[61]
+    right_corner = landmarks[291]
+    gestures["smile"] = float(left_corner[1]<landmarks[0][1] and right_corner[1]<landmarks[0][1])
+    gestures["left_eye_open"]=float(np.linalg.norm(np.mean(landmarks[[386,387]],axis=0)-np.mean(landmarks[[374,373]],axis=0))>0.01)
+    gestures["right_eye_open"]=float(np.linalg.norm(np.mean(landmarks[[159,160]],axis=0)-np.mean(landmarks[[145,144]],axis=0))>0.01)
+    gestures["left_eye_closed"]=1.0-gestures["left_eye_open"]
+    gestures["right_eye_closed"]=1.0-gestures["right_eye_open"]
+    gestures["left_eyebrow_up"]=float(np.mean(landmarks[[282,283]],axis=0)[1]<landmarks[10][1])
+    gestures["left_eyebrow_down"]=1.0-gestures["left_eyebrow_up"]
+    gestures["right_eyebrow_up"]=float(np.mean(landmarks[[52,53]],axis=0)[1]<landmarks[10][1])
+    gestures["right_eyebrow_down"]=1.0-gestures["right_eyebrow_up"]
+    return gestures
+
+# ======================
+# Cascade Scheduler
+# ======================
+class StagedCascadeScheduler:
+    def __init__(self, blazeface_model, dlib_model, facemesh_model, conf_target=CONF_TARGET):
+        self.blazeface_model = blazeface_model
+        self.dlib_model = dlib_model
+        self.facemesh_model = facemesh_model
+        self.conf_target = conf_target
+
+    def process(self, frame):
+        runtimes = []
+
+        # Stage 1: BlazeFace
+        bf_res, bf_conf, bf_rt = self.blazeface_model.run(frame)
+        runtimes.append(("BlazeFaceWrapper", bf_rt))
+        if bf_res is None:
+            return {"result": None, "conf": 0.0, "runtimes": runtimes, "model_used": None}
+
+        # Stage 2: Dlib
+        dlib_res, dlib_conf, dlib_rt = self.dlib_model.run(frame)
+        runtimes.append(("DlibWrapper", dlib_rt))
+        if dlib_res is not None and dlib_conf >= self.conf_target:
+            return {"result": dlib_res, "conf": dlib_conf, "runtimes": runtimes, "model_used": "DlibWrapper"}
+
+        # Stage 3: FaceMesh if Dlib low confidence
+        fm_res, fm_conf, fm_rt = self.facemesh_model.run(frame)
+        runtimes.append(("FaceMeshWrapper", fm_rt))
+        if fm_res is not None:
+            return {"result": fm_res, "conf": fm_conf, "runtimes": runtimes, "model_used": "FaceMeshWrapper"}
+
+        return {"result": dlib_res, "conf": dlib_conf, "runtimes": runtimes, "model_used": "DlibWrapper"}
+
+# ======================
+# Vision Session Loop
+# ======================
+def vision_session_loop(grabber, cascade):
+    print("[Vision] Starting vision session. Press 'q' to quit manually.")
+    last_face_check = 0.0
+    totals = {
+        "frames": 0,
+        "by_model": defaultdict(int),
+        "gestures": defaultdict(float),
+        "cpu": [],
+        "mem": [],
+        "ram": [],
+        "compute_time_ms": []
+    }
+
+    f = open(VISION_LOG_CSV, "a", newline="")
+    writer = csv.writer(f)
+    if os.path.getsize(VISION_LOG_CSV) == 0:
+        writer.writerow(["Timestamp","ModelUsed","Conf","TotalTimeMs","Runtimes","Gestures","CPU%","Mem%","RAM(MB)"])
+    process = psutil.Process()
+
+    try:
+        while True:
+            frame = grabber.latest()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            now = time.time()
+            if now - last_face_check >= FACE_CHECK_INTERVAL_S:
+                last_face_check = now
+                bf_res, bf_conf, bf_rt = cascade.blazeface_model.run(frame)
+                if bf_res is None:
+                    print("[Vision] Face lost during periodic check, session continues (no auto-end).")
+
+            out = cascade.process(frame)
+            result = out["result"]
+            conf = out["conf"]
+            model_used = out["model_used"]
+            totals["frames"] += 1
+            totals["by_model"][model_used] += 1
+            if result and "gestures" in result:
+                for k,v in result["gestures"].items():
+                    totals["gestures"][k] += v
+
+            cpu = process.cpu_percent(interval=None)
+            mem = process.memory_percent()
+            ram = process.memory_info().rss/(1024**2)
+            totals["cpu"].append(cpu)
+            totals["mem"].append(mem)
+            totals["ram"].append(ram)
+            totals["compute_time_ms"].append(sum([r[1] for r in out["runtimes"]]))
+
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            writer.writerow([ts, model_used, conf, sum([r[1] for r in out["runtimes"]]), str(out["runtimes"]), str(result.get("gestures") if result else None), cpu, mem, ram])
+            f.flush()
+
+            display = frame.copy()
+            if result:
+                if result["label"]=="blazeface":
+                    bbox = result["bbox"]
+                    ih, iw, _ = frame.shape
+                    x1 = int(bbox.xmin*iw)
+                    y1 = int(bbox.ymin*ih)
+                    x2 = int((bbox.xmin+bbox.width)*iw)
+                    y2 = int((bbox.ymin+bbox.height)*ih)
+                    cv2.rectangle(display,(x1,y1),(x2,y2),(255,0,0),2)
+                elif result["label"]=="dlib_landmarks":
+                    for (x,y) in result["landmarks"]:
+                        cv2.circle(display,(x,y),1,(0,255,255),-1)
+                elif result["label"]=="landmarks_facemesh":
+                    ih, iw, _ = frame.shape
+                    for (x,y,_) in result["landmarks"]:
+                        cv2.circle(display,(int(x*iw),int(y*ih)),1,(0,0,255),-1)
+            cv2.putText(display,f"{model_used} conf={conf:.2f}",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2)
+            cv2.imshow("Vision - press q to quit",display)
+            key = cv2.waitKey(1)&0xFF
+            if key==ord("q"):
+                print("[Vision] User requested quit (q).")
+                break
+
+    finally:
+        f.close()
+        cv2.destroyAllWindows()
+        print("[Vision] Session ended. Totals:")
+        print(totals)
+        with open("vision_totals_summary.csv","a",newline="") as fsum:
+            writer = csv.writer(fsum)
+            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), totals["frames"], dict(totals["by_model"]), dict(totals["gestures"]),
+                             round(np.mean(totals["cpu"]),1), round(np.mean(totals["mem"]),1), round(np.mean(totals["ram"]),1),
+                             round(np.mean(totals["compute_time_ms"]),1)])
+        print("[Vision] Summary saved.")
+
+# ======================
+# Main
+# ======================
+def main():
+    grabber = FrameGrabber(src=CAM_INDEX, width=FRAME_WIDTH, height=FRAME_HEIGHT)
+    grabber.start()
+
+    wake_queue = queue.Queue()
+    audio_thread = AudioWakeWord(ACCESS_KEY, KEYWORD_PATH, wake_queue)
+    audio_thread.start()
+
+    bf_model = BlazeFaceWrapper()
+    dlib_model = DlibWrapper()
+    fm_model = FaceMeshWrapper()
+    cascade = StagedCascadeScheduler(bf_model, dlib_model, fm_model)
+
+    try:
+        while True:
+            try:
+                msg = wake_queue.get(timeout=1.0)
+                if msg[0]=="START":
+                    print("[Main] Wake received -> starting vision session")
+                    vision_session_loop(grabber, cascade)
+            except queue.Empty:
+                continue
+    except KeyboardInterrupt:
+        print("[Main] Exiting cleanly.")
+    finally:
+        grabber.stop()
+        audio_thread.running = False
+
+if __name__=="__main__":
+    main()
