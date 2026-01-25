@@ -28,9 +28,9 @@ import psutil
 # ---------------------
 # === CONFIGURATION ===
 # ---------------------
-ACCESS_KEY = "9cunUiGZPhy31M1VUW5TBgQSc9Re48V5fXew+2V0KmjCDG/CkJo7Yw=="
-KEYWORD_PATH = "/Users/tanishdasari/Downloads/Start_en_mac_v3_0_0/Start_en_mac_v3_0_0.ppn"
-PREDICTOR_PATH = "/Users/tanishdasari/shape_predictor_68_face_landmarks.dat"
+ACCESS_KEY = "" # fill with access key
+KEYWORD_PATH = "" # fill with location to .ppn file
+PREDICTOR_PATH = "" # fill with location to .dat file
 CAM_INDEX = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
