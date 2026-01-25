@@ -17,7 +17,7 @@ import psutil
 # ---------------------
 # === CONFIGURATION ===
 # ---------------------
-ACCESS_KEY = "9cunUiGZPhy31M1VUW5TBgQSc9Re48V5fXew+2V0KmjCDG/CkJo7Yw=="
+ACCESS_KEY = "" # fill with access key
 KEYWORD_PATH = "" # fill with location to .ppn file
 PREDICTOR_PATH = "" # fill with location to .dat file
 CAM_INDEX = 0
