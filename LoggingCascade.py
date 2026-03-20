@@ -185,18 +185,20 @@ class StagedCascadeScheduler:
         self.dlib = dlib
         self.fm = fm
 
-    def process(self, frame):
-        dlib_res, dlib_conf, dlib_rt = self.dlib.run(frame)
+def process(self, frame):
+    bf_res, bf_conf, bf_rt = self.bf.run(frame)
+    if not bf_res:
+        return None, 0.0, "BlazeFaceWrapper", bf_rt, 0, 0
 
-        # Stage decision
-        if dlib_res and dlib_conf >= CONF_TARGET:
-            return dlib_res, dlib_conf, "DlibWrapper", 0, dlib_rt, 0
-        fm_res, fm_conf, fm_rt = self.fm.run(frame)
-        if fm_res:
-            return fm_res, fm_conf, "FaceMeshWrapper", 0, dlib_rt, fm_rt
-        else:
-            bf_res, bf_conf, bf_rt = self.bf.run(frame)
-            return None, 0.0, "BlazeFaceWrapper", bf_rt, dlib_rt, fm_rt
+    dlib_res, dlib_conf, dlib_rt = self.dlib.run(frame)
+    if dlib_res and dlib_conf >= CONF_TARGET:
+        return dlib_res, dlib_conf, "DlibWrapper", bf_rt, dlib_rt, 0
+
+    fm_res, fm_conf, fm_rt = self.fm.run(frame)
+    if fm_res:
+        return fm_res, fm_conf, "FaceMeshWrapper", bf_rt, dlib_rt, fm_rt
+
+    return None, 0.0, "FaceMeshWrapper", bf_rt, dlib_rt, fm_rt
 
 # ---------------------
 # Vision Session Loop
